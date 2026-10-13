@@ -7,7 +7,7 @@
 
 ## Server
 
-Put one folder per platform in `roms/` (this folder is gitignored):
+Put one folder per platform in `roms/` (gitignored; here it is a symlink to `/storage/roms` on the HDD):
 
 ```
 roms/

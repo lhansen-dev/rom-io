@@ -1,4 +1,4 @@
-roms/
+/roms
 __pycache__/
 client/build/
 client/*.3dsx
