@@ -3,12 +3,13 @@
 3DS ?= 192.168.1.233:5000
 PORT ?= 8765
 PYTHON ?= python3
+HOST_CC ?= cc
 ROMS_DIR ?= roms
 JOBS ?= 4
 BOOT9 ?=
 CONVERTER ?= .tools/3dsconv/bin/rom-io-3dsconv
 
-.PHONY: help install server client ftp-client unzip convert organize-3ds cia install-converter test clean
+.PHONY: help install server client ftp-client unzip convert organize-3ds cia install-converter test test-client clean
 
 help: ## Show available targets and configuration
 	@printf 'Usage: make [target] [VARIABLE=value ...]\n\nTargets:\n'
@@ -55,6 +56,11 @@ install-converter: .tools/3dsconv/bin/rom-io-3dsconv ## Install 3dsconv in a loc
 
 test: ## Run the server tests
 	cd server && $(PYTHON) -m unittest
+
+test-client: ## Run download queue tests on the host computer
+	@mkdir -p .tools/tests
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread -Iclient/tests -Iclient/include client/source/download_stream.c client/tests/test_download_stream.c -o .tools/tests/download-stream
+	.tools/tests/download-stream
 
 clean: ## Remove client build artifacts
 	$(MAKE) -C client clean

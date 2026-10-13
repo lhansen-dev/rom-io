@@ -7,11 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include "download_stream.h"
 
 #define CFG_DIR "sdmc:/3ds/rom-io"
 #define CFG_FILE CFG_DIR "/config.txt"
 #define ROWS 24 // leave room for the title, filter, and controls
-#define DOWNLOAD_BUFFER_SIZE (256 * 1024)
+#define NAME_COLUMNS 38
 #define WRITE_BUFFER_SIZE (512 * 1024)
 #define DOWNLOAD_REDRAW_TICKS (SYSCLOCK_ARM11 / 4) // at most four updates per second
 
@@ -115,12 +116,11 @@ static void download_progress(u64 done, u32 size, u64 started, u64 now) {
 
 // Streams to "<dest>.part" and renames on success so a failed download never clobbers a good file.
 static bool download(const char *remote, const char *dest) {
-	static u8 buf[DOWNLOAD_BUFFER_SIZE];
 	static char writebuf[WRITE_BUFFER_SIZE];
 	char part[600];
 	snprintf(part, sizeof part, "%s.part", dest);
 	httpcContext c;
-	u32 size, got;
+	u32 size;
 	u64 done = 0;
 	if (!http_open(&c, remote, &size)) return false;
 	FILE *f = fopen(part, "wb");
@@ -134,27 +134,44 @@ static bool download(const char *remote, const char *dest) {
 		return false;
 	}
 
+	DownloadStream *stream = download_stream_start(&c);
+	if (!stream) {
+		printf("Can't start download worker\n");
+		httpcCancelConnection(&c);
+		httpcCloseContext(&c);
+		fclose(f);
+		remove(part);
+		return false;
+	}
 	bool ok = true;
-	Result r;
+	Result r = 0;
 	u64 started = svcGetSystemTick(), last_redraw = started;
 	download_progress(0, size, started, started);
-	do {
-		got = 0;
-		r = httpcDownloadData(&c, buf, sizeof buf, &got);
-		if (got && fwrite(buf, 1, got, f) != got) { printf("\nWrite failed (SD full?)\n"); ok = false; break; }
-		done += got;
+	for (;;) {
+		const u8 *buf;
+		u32 got;
+		int state = download_stream_next(stream, &buf, &got, &r);
+		if (state == DOWNLOAD_FINISHED) break;
+		if (state == DOWNLOAD_DATA) {
+			bool written = fwrite(buf, 1, got, f) == got;
+			download_stream_release(stream);
+			if (!written) { printf("\nWrite failed (SD full?)\n"); ok = false; break; }
+			done += got;
+		}
 		u64 now = svcGetSystemTick();
-		if (now - last_redraw >= DOWNLOAD_REDRAW_TICKS || r != (Result)HTTPC_RESULTCODE_DOWNLOADPENDING) {
+		if (now - last_redraw >= DOWNLOAD_REDRAW_TICKS) {
 			download_progress(done, size, started, now);
 			last_redraw = now;
 		}
 		hidScanInput();
 		if (!aptMainLoop() || (hidKeysDown() & KEY_B)) { printf("\nCancelled\n"); ok = false; break; }
-	} while (r == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING);
+	}
+	download_stream_stop(stream);
 	if (ok && (R_FAILED(r) || done != size)) { printf("\nDownload error %08lX\n", (unsigned long)r); ok = false; }
 	if (!ok) httpcCancelConnection(&c);
 	httpcCloseContext(&c);
 	if (fclose(f) != 0 && ok) { printf("\nWrite failed\n"); ok = false; }
+	if (ok) download_progress(done, size, started, svcGetSystemTick());
 	if (ok) {
 		remove(dest);
 		if (rename(part, dest) != 0) { printf("\nRename to %s failed\n", dest); ok = false; }
@@ -234,33 +251,61 @@ static int apply_filter(const Entry *all, int n, const char *filter, Entry *out)
 	return m;
 }
 
+static int entry_rows(const Entry *entry) {
+	size_t length = strlen(entry->name);
+	return length ? (length + NAME_COLUMNS - 1) / NAME_COLUMNS : 1;
+}
+
+static void draw_entry(const Entry *entry, bool selected) {
+	char size[16];
+	fmt_size(size, entry->size);
+	const char *name = entry->name;
+	bool first = true;
+	do {
+		printf("%c %-*.*s %8s\n", first && selected ? '>' : ' ',
+			NAME_COLUMNS, NAME_COLUMNS, name, first ? size : "");
+		size_t length = strlen(name);
+		name += length < NAME_COLUMNS ? length : NAME_COLUMNS;
+		first = false;
+	} while (*name);
+}
+
 // Draws the listing and handles scrolling; returns the action key that left the menu.
 static u32 menu(const char *path, const char *filter, Entry *e, int n, int *cur) {
 	for (;;) {
 		consoleClear();
 		printf("%.49s\n%.49s\n", server, path);
 		if (filter[0]) printf("Filter: %.41s\n", filter);
-		int top = *cur - ROWS / 2;
-		if (top > n - ROWS) top = n - ROWS;
-		if (top < 0) top = 0;
-		for (int i = top; i < n && i < top + ROWS; i++) {
-			char sz[16];
-			fmt_size(sz, e[i].size);
-			printf("%c %-38.38s %8s\n", i == *cur ? '>' : ' ', e[i].name, sz);
+		// Count physical rows so wrapped names do not scroll the controls off
+		// screen. Start near the selection and show only complete entries.
+		int top = n ? *cur : 0, used = n ? entry_rows(&e[top]) : 0;
+		while (top > 0 && used + entry_rows(&e[top - 1]) <= ROWS / 2) {
+			used += entry_rows(&e[--top]);
 		}
+		int end = top;
+		used = 0;
+		while (end < n && used + entry_rows(&e[end]) <= ROWS)
+			used += entry_rows(&e[end++]);
+		if (end == n) {
+			while (top > 0 && used + entry_rows(&e[top - 1]) <= ROWS)
+				used += entry_rows(&e[--top]);
+		}
+		for (int i = top; i < end; i++) draw_entry(&e[i], i == *cur);
+		int page = end - top;
 		if (!n) printf("  (empty)\n");
 		printf("\nA:open B:back Y:filter X:server\nR:refresh START:quit");
 
 		u32 k = wait_key();
 		if (n && (k & KEY_DOWN)) *cur = (*cur + 1) % n;
 		else if (n && (k & KEY_UP)) *cur = (*cur + n - 1) % n;
-		else if (n && (k & KEY_RIGHT)) *cur = *cur + ROWS < n ? *cur + ROWS : n - 1;
-		else if (n && (k & KEY_LEFT)) *cur = *cur > ROWS ? *cur - ROWS : 0;
+		else if (n && (k & KEY_RIGHT)) *cur = *cur + page < n ? *cur + page : n - 1;
+		else if (n && (k & KEY_LEFT)) *cur = *cur > page ? *cur - page : 0;
 		else if (k & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_R | KEY_START)) return k;
 	}
 }
 
 int main(void) {
+	osSetSpeedupEnable(true);
 	gfxInitDefault();
 	consoleInit(GFX_TOP, NULL);
 	httpcInit(0);
