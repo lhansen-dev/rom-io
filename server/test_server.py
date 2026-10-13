@@ -1,6 +1,8 @@
+import http.client
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from functools import partial
@@ -40,6 +42,16 @@ class ServerTest(unittest.TestCase):
             self.get("/../secret.txt")
         with self.assertRaises(urllib.error.HTTPError):
             self.get("/gba/%2e%2e/%2e%2e/secret.txt")
+
+    def test_client_disconnect_does_not_raise_server_error(self):
+        for error in (ConnectionResetError, BrokenPipeError):
+            with self.subTest(error=error.__name__):
+                with patch.object(self.srv, "handle_error") as handle_error:
+                    with patch.object(Handler, "copyfile", side_effect=error("disconnected")):
+                        with self.assertRaises(http.client.IncompleteRead):
+                            self.get("/gba/My%20Game%20%28USA%29.gba")
+                    handle_error.assert_not_called()
+                self.assertEqual(self.get("/gba/My%20Game%20%28USA%29.gba"), b"x" * 10)
 
 
 if __name__ == "__main__":

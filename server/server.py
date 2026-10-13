@@ -13,6 +13,12 @@ from pathlib import Path
 
 
 class Handler(SimpleHTTPRequestHandler):
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            self.log_message("Client disconnected before the response completed")
+
     # translate_path() from the base class already drops ".." so requests stay inside the root.
     def list_directory(self, path):
         try:

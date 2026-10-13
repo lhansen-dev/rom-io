@@ -2,6 +2,7 @@
 #define _GNU_SOURCE // strcasestr
 #include <3ds.h>
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +10,10 @@
 
 #define CFG_DIR "sdmc:/3ds/rom-io"
 #define CFG_FILE CFG_DIR "/config.txt"
-#define ROWS 26 // listing rows that fit on the top screen under the title
+#define ROWS 24 // leave room for the title, filter, and controls
+#define DOWNLOAD_BUFFER_SIZE (256 * 1024)
+#define WRITE_BUFFER_SIZE (512 * 1024)
+#define DOWNLOAD_REDRAW_TICKS (SYSCLOCK_ARM11 / 4) // at most four updates per second
 
 typedef struct { char *name; long long size; } Entry; // size < 0 means folder (name ends in '/')
 
@@ -95,31 +99,61 @@ static char *fetch_listing(const char *path) {
 	return buf;
 }
 
+static void download_progress(u64 done, u32 size, u64 started, u64 now) {
+	double seconds = (now - started) / (double)SYSCLOCK_ARM11;
+	double bytes_per_second = seconds > 0 ? done / seconds : 0;
+	u64 remaining = done < size ? size - done : 0;
+	u64 eta = bytes_per_second > 0 ? (u64)(remaining / bytes_per_second) : 0;
+	printf("\r\033[2K%lu/%lu MiB  %.2f MiB/s", (unsigned long)(done / 1048576),
+		(unsigned long)(size / 1048576), bytes_per_second / 1048576.0);
+	if (bytes_per_second > 0)
+		printf("  ETA %llu:%02llu", (unsigned long long)(eta / 60), (unsigned long long)(eta % 60));
+	// Download progress does not need to wait for a display frame.
+	gfxFlushBuffers();
+	gfxSwapBuffers();
+}
+
 // Streams to "<dest>.part" and renames on success so a failed download never clobbers a good file.
 static bool download(const char *remote, const char *dest) {
-	static u8 buf[0x10000];
+	static u8 buf[DOWNLOAD_BUFFER_SIZE];
+	static char writebuf[WRITE_BUFFER_SIZE];
 	char part[600];
 	snprintf(part, sizeof part, "%s.part", dest);
 	httpcContext c;
-	u32 size, done = 0, got;
+	u32 size, got;
+	u64 done = 0;
 	if (!http_open(&c, remote, &size)) return false;
 	FILE *f = fopen(part, "wb");
-	if (!f) { printf("Can't create %s\n", part); httpcCloseContext(&c); return false; }
+	if (!f) { printf("Can't create %s\n", part); httpcCancelConnection(&c); httpcCloseContext(&c); return false; }
+	if (setvbuf(f, writebuf, _IOFBF, sizeof writebuf) != 0) {
+		printf("Can't buffer SD writes\n");
+		httpcCancelConnection(&c);
+		httpcCloseContext(&c);
+		fclose(f);
+		remove(part);
+		return false;
+	}
 
 	bool ok = true;
 	Result r;
+	u64 started = svcGetSystemTick(), last_redraw = started;
+	download_progress(0, size, started, started);
 	do {
 		got = 0;
 		r = httpcDownloadData(&c, buf, sizeof buf, &got);
 		if (got && fwrite(buf, 1, got, f) != got) { printf("\nWrite failed (SD full?)\n"); ok = false; break; }
 		done += got;
-		printf("\r%lu / %lu KB   ", (unsigned long)done / 1024, (unsigned long)size / 1024);
-		present();
+		u64 now = svcGetSystemTick();
+		if (now - last_redraw >= DOWNLOAD_REDRAW_TICKS || r != (Result)HTTPC_RESULTCODE_DOWNLOADPENDING) {
+			download_progress(done, size, started, now);
+			last_redraw = now;
+		}
 		hidScanInput();
-		if (hidKeysDown() & KEY_B) { printf("\nCancelled\n"); ok = false; break; }
+		if (!aptMainLoop() || (hidKeysDown() & KEY_B)) { printf("\nCancelled\n"); ok = false; break; }
 	} while (r == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING);
-	httpcCloseContext(&c);
 	if (ok && (R_FAILED(r) || done != size)) { printf("\nDownload error %08lX\n", (unsigned long)r); ok = false; }
+	if (!ok) httpcCancelConnection(&c);
+	httpcCloseContext(&c);
 	if (fclose(f) != 0 && ok) { printf("\nWrite failed\n"); ok = false; }
 	if (ok) {
 		remove(dest);
@@ -129,7 +163,16 @@ static bool download(const char *remote, const char *dest) {
 	return ok;
 }
 
-static void download_flow(const char *path, const char *name) {
+static void download_flow(const char *path, const char *name, long long size) {
+	if (size > 0xFFFFFFFFLL) {
+		consoleClear();
+		printf("%s\n\nFile is too large for the SD card.\n"
+			"FAT32 files must be smaller than 4 GiB.\n\n"
+			"Trim this ROM or convert it to a smaller\n"
+			"CIA on your computer first.\n\nPress any button", name);
+		wait_key();
+		return;
+	}
 	char dir[256];
 	strcpy(dir, destdir);
 	if (!keyboard("Save to folder (e.g. sdmc:/roms/gba)", dir, sizeof dir)) return;
@@ -143,9 +186,24 @@ static void download_flow(const char *path, const char *name) {
 	consoleClear();
 	struct stat st;
 	if (stat(dest, &st) == 0) {
-		printf("%s already exists.\n\nA: overwrite   B: cancel\n", dest);
-		if (!(wait_key() & KEY_A)) return;
+		if (!S_ISREG(st.st_mode)) {
+			printf("Destination is not a regular file:\n%s\n\nPress any button", dest);
+			wait_key();
+			return;
+		}
+		printf("File already exists:\n%s\n\n"
+			"Overwrite the original?\n\nA: overwrite   B: cancel\n", dest);
+		for (;;) {
+			u32 key = wait_key();
+			if (key & (KEY_B | KEY_START)) return;
+			if (key & KEY_A) break;
+		}
+	} else if (errno != ENOENT) {
+		printf("Can't check destination:\n%s\n%s\n\nPress any button", dest, strerror(errno));
+		wait_key();
+		return;
 	}
+	consoleClear();
 	printf("Downloading %s\nto %s\n\nB: cancel\n\n", name, dir);
 	if (download(remote, dest)) {
 		strcpy(destdir, dir);
@@ -176,7 +234,7 @@ static int apply_filter(const Entry *all, int n, const char *filter, Entry *out)
 	return m;
 }
 
-// Draws the listing and handles scrolling; returns the key (A/B/X/Y/START) that left the menu.
+// Draws the listing and handles scrolling; returns the action key that left the menu.
 static u32 menu(const char *path, const char *filter, Entry *e, int n, int *cur) {
 	for (;;) {
 		consoleClear();
@@ -191,14 +249,14 @@ static u32 menu(const char *path, const char *filter, Entry *e, int n, int *cur)
 			printf("%c %-38.38s %8s\n", i == *cur ? '>' : ' ', e[i].name, sz);
 		}
 		if (!n) printf("  (empty)\n");
-		printf("\nA:open B:back Y:filter X:server START:quit");
+		printf("\nA:open B:back Y:filter X:server\nR:refresh START:quit");
 
 		u32 k = wait_key();
 		if (n && (k & KEY_DOWN)) *cur = (*cur + 1) % n;
 		else if (n && (k & KEY_UP)) *cur = (*cur + n - 1) % n;
 		else if (n && (k & KEY_RIGHT)) *cur = *cur + ROWS < n ? *cur + ROWS : n - 1;
 		else if (n && (k & KEY_LEFT)) *cur = *cur > ROWS ? *cur - ROWS : 0;
-		else if (k & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START)) return k;
+		else if (k & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_R | KEY_START)) return k;
 	}
 }
 
@@ -213,6 +271,7 @@ int main(void) {
 	}
 
 	char path[1024] = "/", filter[64] = "";
+	char selected[512] = "";
 	for (;;) {
 		consoleClear();
 		char *list = fetch_listing(path);
@@ -220,7 +279,9 @@ int main(void) {
 			printf("\nCouldn't load %s\n\nA: retry   X: change server   START: quit\n", path);
 			u32 k = wait_key();
 			if (k & KEY_START) break;
-			if ((k & KEY_X) && keyboard("Server IP:port", server, sizeof server)) { save_config(); strcpy(path, "/"); }
+			if ((k & KEY_X) && keyboard("Server IP:port", server, sizeof server)) {
+				save_config(); strcpy(path, "/"); filter[0] = 0; selected[0] = 0;
+			}
 			continue;
 		}
 
@@ -233,33 +294,39 @@ int main(void) {
 			if (tab) { *tab = 0; all[total].size = strtoll(tab + 1, NULL, 10); }
 			total++;
 		}
-		filter[0] = 0;
 		int n = apply_filter(all, total, filter, e);
 
 		int cur = 0;
+		for (int i = 0; selected[0] && i < n; i++)
+			if (!strcmp(e[i].name, selected)) { cur = i; break; }
+		selected[0] = 0;
 		bool quit = false, reload = false;
 		while (!quit && !reload) {
 			u32 k = menu(path, filter, e, n, &cur);
 			if (k & KEY_START) quit = true;
-			else if (k & KEY_Y) {
+			else if (k & KEY_R) {
+				if (n) snprintf(selected, sizeof selected, "%s", e[cur].name);
+				reload = true;
+			} else if (k & KEY_Y) {
 				if (keyboard("Filter: words to match", filter, sizeof filter)) { n = apply_filter(all, total, filter, e); cur = 0; }
 			} else if ((k & KEY_B) && filter[0]) {
 				filter[0] = 0;
 				n = apply_filter(all, total, filter, e);
 				cur = 0;
 			} else if (k & KEY_X) {
-				if (keyboard("Server IP:port", server, sizeof server)) { save_config(); strcpy(path, "/"); reload = true; }
+				if (keyboard("Server IP:port", server, sizeof server)) { save_config(); strcpy(path, "/"); filter[0] = 0; reload = true; }
 			} else if (k & KEY_B) {
 				if (strcmp(path, "/")) { // drop the last "name/" component
 					path[strlen(path) - 1] = 0;
 					strrchr(path, '/')[1] = 0;
+					filter[0] = 0;
 					reload = true;
 				}
 			} else if ((k & KEY_A) && n) {
 				if (e[cur].size < 0) {
-					if (strlen(path) + strlen(e[cur].name) < sizeof path) { strcat(path, e[cur].name); reload = true; }
+					if (strlen(path) + strlen(e[cur].name) < sizeof path) { strcat(path, e[cur].name); filter[0] = 0; reload = true; }
 				} else {
-					download_flow(path, e[cur].name);
+					download_flow(path, e[cur].name, e[cur].size);
 				}
 			}
 		}
