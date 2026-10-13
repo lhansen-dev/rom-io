@@ -1,0 +1,6 @@
+roms/
+__pycache__/
+client/build/
+client/*.3dsx
+client/*.smdh
+client/*.elf
