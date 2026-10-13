@@ -193,7 +193,7 @@ int main(void) {
 	httpcInit(0);
 	load_config();
 	if (!server[0]) {
-		if (!keyboard("Server IP:port, e.g. 192.168.1.10:8080", server, sizeof server)) goto quit;
+		if (!keyboard("Server IP:port, e.g. 192.168.1.10:8765", server, sizeof server)) goto quit;
 		save_config();
 	}
 

@@ -33,7 +33,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--root", default=Path(__file__).resolve().parent.parent / "roms")
-    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--port", type=int, default=8765)
     a = p.parse_args()
     if not Path(a.root).is_dir():
         raise SystemExit(f"ROM folder not found: {a.root}")
