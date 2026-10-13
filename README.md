@@ -5,6 +5,16 @@
 - `server/`: a small Python HTTP server (standard library only) that serves `roms/`.
 - `client/`: a 3DS homebrew app (`rom-io.3dsx`) for browsing the server and downloading ROMs to the SD card.
 
+## Make targets
+
+| | |
+|---|---|
+| `make install` | install dependencies (Arch, with the devkitPro pacman repo) |
+| `make server` | start the server (`PORT=...` to override 8765) |
+| `make ftp-client` | build the client and FTP it to the 3DS's `/3ds/rom-io.3dsx`, replacing the old one (`3DS=ip:port` to override 192.168.1.233:5000; open ftpd on the 3DS first) |
+| `make unzip` | extract every zip under `roms/` next to itself, deleting each zip that extracted cleanly |
+| `make test` | server tests |
+
 ## Server
 
 Put one folder per platform in `roms/` (gitignored; here it is a symlink to `/storage/roms` on the HDD):
@@ -36,6 +46,6 @@ cd client && make
 Copy `client/rom-io.3dsx` to `sdmc:/3ds/` and launch it from the Homebrew Launcher.
 
 - The first time it runs, enter the server address, e.g. `192.168.1.10:8765`.
-- **D-pad / Circle Pad**: move. **Left / Right**: page up/down. **A**: open a folder or download a file. **B**: go up a folder (or cancel a download). **X**: change the server. **START**: quit.
+- **D-pad / Circle Pad**: move. **Left / Right**: page up/down. **A**: open a folder or download a file. **Y**: filter the list (every word must appear in the name, ignoring case). **B**: clear the filter, else go up a folder (or cancel a download). **X**: change the server. **START**: quit.
 - When you download, the app asks for a destination folder (default: the last one you used) and creates it if it doesn't exist. It downloads to `<name>.part` first, then renames the file when the download finishes, so a failed download never overwrites a good file.
 - Settings are saved to `sdmc:/3ds/rom-io/config.txt`. Line 1 is the server and line 2 is the last folder you used.

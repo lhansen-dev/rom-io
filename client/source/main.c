@@ -1,4 +1,5 @@
 // rom-io 3DS client: browse the rom-io server over HTTP and download ROMs to the SD card.
+#define _GNU_SOURCE // strcasestr
 #include <3ds.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -162,11 +163,25 @@ static void fmt_size(char *out, long long b) {
 	else sprintf(out, "%.2fG", b / 1073741824.0);
 }
 
-// Draws the listing and handles scrolling; returns the key (A/B/X/START) that left the menu.
-static u32 menu(const char *path, Entry *e, int n, int *cur) {
+// Copies the entries whose names contain every space-separated word of filter, ignoring case.
+static int apply_filter(const Entry *all, int n, const char *filter, Entry *out) {
+	int m = 0;
+	for (int i = 0; i < n; i++) {
+		char words[64];
+		strcpy(words, filter);
+		bool ok = true;
+		for (char *w = strtok(words, " "); w && ok; w = strtok(NULL, " ")) ok = strcasestr(all[i].name, w);
+		if (ok) out[m++] = all[i];
+	}
+	return m;
+}
+
+// Draws the listing and handles scrolling; returns the key (A/B/X/Y/START) that left the menu.
+static u32 menu(const char *path, const char *filter, Entry *e, int n, int *cur) {
 	for (;;) {
 		consoleClear();
 		printf("%.49s\n%.49s\n", server, path);
+		if (filter[0]) printf("Filter: %.41s\n", filter);
 		int top = *cur - ROWS / 2;
 		if (top > n - ROWS) top = n - ROWS;
 		if (top < 0) top = 0;
@@ -176,14 +191,14 @@ static u32 menu(const char *path, Entry *e, int n, int *cur) {
 			printf("%c %-38.38s %8s\n", i == *cur ? '>' : ' ', e[i].name, sz);
 		}
 		if (!n) printf("  (empty)\n");
-		printf("\nA:open B:back X:server START:quit");
+		printf("\nA:open B:back Y:filter X:server START:quit");
 
 		u32 k = wait_key();
 		if (n && (k & KEY_DOWN)) *cur = (*cur + 1) % n;
 		else if (n && (k & KEY_UP)) *cur = (*cur + n - 1) % n;
 		else if (n && (k & KEY_RIGHT)) *cur = *cur + ROWS < n ? *cur + ROWS : n - 1;
 		else if (n && (k & KEY_LEFT)) *cur = *cur > ROWS ? *cur - ROWS : 0;
-		else if (k & (KEY_A | KEY_B | KEY_X | KEY_START)) return k;
+		else if (k & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START)) return k;
 	}
 }
 
@@ -197,7 +212,7 @@ int main(void) {
 		save_config();
 	}
 
-	char path[1024] = "/";
+	char path[1024] = "/", filter[64] = "";
 	for (;;) {
 		consoleClear();
 		char *list = fetch_listing(path);
@@ -209,22 +224,30 @@ int main(void) {
 			continue;
 		}
 
-		int n = 0, max = 1;
+		int total = 0, max = 1;
 		for (char *p = list; *p; p++) max += *p == '\n';
-		Entry *e = calloc(max, sizeof *e);
+		Entry *all = calloc(max, sizeof *all), *e = calloc(max, sizeof *e); // e = entries shown after filtering
 		for (char *line = strtok(list, "\n"); line; line = strtok(NULL, "\n")) {
 			char *tab = strchr(line, '\t');
-			e[n] = (Entry){ line, -1 };
-			if (tab) { *tab = 0; e[n].size = strtoll(tab + 1, NULL, 10); }
-			n++;
+			all[total] = (Entry){ line, -1 };
+			if (tab) { *tab = 0; all[total].size = strtoll(tab + 1, NULL, 10); }
+			total++;
 		}
+		filter[0] = 0;
+		int n = apply_filter(all, total, filter, e);
 
 		int cur = 0;
 		bool quit = false, reload = false;
 		while (!quit && !reload) {
-			u32 k = menu(path, e, n, &cur);
+			u32 k = menu(path, filter, e, n, &cur);
 			if (k & KEY_START) quit = true;
-			else if (k & KEY_X) {
+			else if (k & KEY_Y) {
+				if (keyboard("Filter: words to match", filter, sizeof filter)) { n = apply_filter(all, total, filter, e); cur = 0; }
+			} else if ((k & KEY_B) && filter[0]) {
+				filter[0] = 0;
+				n = apply_filter(all, total, filter, e);
+				cur = 0;
+			} else if (k & KEY_X) {
 				if (keyboard("Server IP:port", server, sizeof server)) { save_config(); strcpy(path, "/"); reload = true; }
 			} else if (k & KEY_B) {
 				if (strcmp(path, "/")) { // drop the last "name/" component
@@ -240,6 +263,7 @@ int main(void) {
 				}
 			}
 		}
+		free(all);
 		free(e);
 		free(list);
 		if (quit) break;
