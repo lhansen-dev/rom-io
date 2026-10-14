@@ -18,7 +18,7 @@ typedef struct HostThread *Thread;
 typedef struct {
 	pthread_mutex_t lock;
 	pthread_cond_t changed;
-	u64 length, offset, fail_at;
+	u64 length, offset, fail_at, base;
 	unsigned calls;
 	bool blocked, cancelled;
 } httpcContext;

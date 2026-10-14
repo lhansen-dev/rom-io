@@ -1,8 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
 #include "download_stream.h"
+#include "download_ranges.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #define CHUNK (256 * 1024)
@@ -61,7 +63,7 @@ Result httpcDownloadData(httpcContext *context, u8 *buffer, u32 size, u32 *got) 
 	u64 end = context->length < context->fail_at ? context->length : context->fail_at;
 	u64 left = context->offset < end ? end - context->offset : 0;
 	*got = left < size ? left : size;
-	for (u32 i = 0; i < *got; i++) buffer[i] = pattern(context->offset + i);
+	for (u32 i = 0; i < *got; i++) buffer[i] = pattern(context->base + context->offset + i);
 	context->offset += *got;
 	Result result = context->offset >= context->fail_at ? READ_ERROR :
 		(context->offset == context->length ? 0 : (Result)HTTPC_RESULTCODE_DOWNLOADPENDING);
@@ -116,6 +118,101 @@ static void check_transfer(u64 length, u64 fail_at) {
 	cleanup(&context);
 }
 
+static void check_parallel(unsigned count) {
+	const u64 length = 13 * CHUNK + 19;
+	u8 *output = malloc(length);
+	assert(output);
+	httpcContext contexts[MAX_DOWNLOAD_STREAMS];
+	DownloadStream *streams[MAX_DOWNLOAD_STREAMS];
+	u64 written[MAX_DOWNLOAD_STREAMS] = {0};
+	bool finished[MAX_DOWNLOAD_STREAMS] = {0};
+	unsigned remaining = count;
+	for (unsigned i = 0; i < count; i++) {
+		u32 start, size;
+		download_range(length, i, count, &start, &size);
+		init(&contexts[i], size);
+		contexts[i].base = start;
+		streams[i] = download_stream_start(&contexts[i]);
+		assert(streams[i]);
+	}
+	while (remaining) {
+		bool active = false;
+		for (unsigned i = 0; i < count; i++) {
+			if (finished[i]) continue;
+			const u8 *data;
+			u32 size;
+			Result result;
+			int state = download_stream_poll(streams[i], &data, &size, &result);
+			if (state == DOWNLOAD_DATA) {
+				assert(written[i] + size <= contexts[i].length);
+				memcpy(output + contexts[i].base + written[i], data, size);
+				written[i] += size;
+				download_stream_release(streams[i]);
+				active = true;
+			} else if (state == DOWNLOAD_FINISHED) {
+				assert(result == 0);
+				assert(written[i] == contexts[i].length);
+				finished[i] = true;
+				remaining--;
+			}
+		}
+		if (!active) { struct timespec delay = { .tv_nsec = 1000000 }; nanosleep(&delay, NULL); }
+	}
+	for (u64 i = 0; i < length; i++) assert(output[i] == pattern(i));
+	for (unsigned i = 0; i < count; i++) { download_stream_stop(streams[i]); cleanup(&contexts[i]); }
+	free(output);
+}
+
+static Result reject_response(httpcContext *context, void *arg) {
+	(void)context; (void)arg;
+	return READ_ERROR;
+}
+
+static Result wait_response(httpcContext *context, void *arg) {
+	(void)arg;
+	LightLock_Lock(&context->lock);
+	context->calls++;
+	CondVar_Broadcast(&context->changed);
+	while (!context->cancelled) CondVar_Wait(&context->changed, &context->lock);
+	LightLock_Unlock(&context->lock);
+	return READ_ERROR;
+}
+
+static void check_startup(void) {
+	httpcContext slow, ready;
+	init(&slow, CHUNK);
+	init(&ready, CHUNK);
+	DownloadStream *waiting = download_stream_start_checked(&slow, wait_response, NULL);
+	DownloadStream *reading = download_stream_start(&ready);
+	assert(waiting && reading);
+	wait_calls(&slow, 1);
+	const u8 *data;
+	u32 size;
+	Result result;
+	assert(download_stream_poll(waiting, &data, &size, &result) == DOWNLOAD_WAITING);
+	// A response stalled during startup must not prevent another stream from
+	// delivering data to the consumer, or prevent cancellation and joining.
+	int state;
+	do { state = download_stream_next(reading, &data, &size, &result); } while (state == DOWNLOAD_WAITING);
+	assert(state == DOWNLOAD_DATA && size == CHUNK);
+	for (u32 i = 0; i < size; i++) assert(data[i] == pattern(i));
+	download_stream_release(reading);
+	download_stream_stop(waiting);
+	download_stream_stop(reading);
+	assert(slow.cancelled);
+	cleanup(&slow);
+	cleanup(&ready);
+
+	init(&slow, CHUNK);
+	waiting = download_stream_start_checked(&slow, reject_response, NULL);
+	assert(waiting);
+	do { state = download_stream_next(waiting, &data, &size, &result); } while (state == DOWNLOAD_WAITING);
+	assert(state == DOWNLOAD_FINISHED && result == READ_ERROR);
+	assert(slow.calls == 0); // never read a body whose headers failed validation
+	download_stream_stop(waiting);
+	cleanup(&slow);
+}
+
 int main(void) {
 	// Empty, partial, aligned, and many wraps of the ring buffer.
 	check_transfer(0, U64_MAX);
@@ -124,6 +221,20 @@ int main(void) {
 	check_transfer(37 * CHUNK + 17, U64_MAX);
 	// An HTTP error may arrive with a partial final chunk.
 	check_transfer(10 * CHUNK, CHUNK + 17);
+	check_startup();
+	for (unsigned count = 2; count <= MAX_DOWNLOAD_STREAMS; count++) {
+		check_parallel(count);
+		// Check the same range calculation near FAT32's maximum file size.
+		u64 covered = 0;
+		for (unsigned i = 0; i < count; i++) {
+			u32 start, length;
+			download_range(UINT32_MAX, i, count, &start, &length);
+			assert(start == covered);
+			assert(length > 0);
+			covered += length;
+		}
+		assert(covered == UINT32_MAX);
+	}
 
 	httpcContext context;
 	init(&context, 20 * CHUNK);
@@ -147,6 +258,7 @@ int main(void) {
 	stream = download_stream_start(&context);
 	assert(stream);
 	wait_calls(&context, 1);
+	assert(download_stream_poll(stream, &data, &size, &result) == DOWNLOAD_WAITING);
 	assert(download_stream_next(stream, &data, &size, &result) == DOWNLOAD_WAITING);
 	download_stream_stop(stream); // producer blocked in the HTTP read
 	assert(context.cancelled);
@@ -156,6 +268,6 @@ int main(void) {
 	fail_thread_create = true;
 	assert(download_stream_start(&context) == NULL);
 	cleanup(&context);
-	puts("Passed: ordered data, ring wrap, partial reads, HTTP errors, full-queue cancellation, stalled-read cancellation, and thread creation failure.");
+	puts("Passed: ordered data, ring wrap, partial reads, 2/3/4 streams, large-file ranges, stalled startup, rejected headers, HTTP errors, cancellation, and thread creation failure.");
 	return 0;
 }

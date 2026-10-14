@@ -8,6 +8,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include "download_stream.h"
+#include "download_ranges.h"
+#include "cia_install.h"
 
 #define CFG_DIR "sdmc:/3ds/rom-io"
 #define CFG_FILE CFG_DIR "/config.txt"
@@ -20,6 +22,7 @@ typedef struct { char *name; long long size; } Entry; // size < 0 means folder (
 
 static char server[64];                 // host:port
 static char destdir[256] = "sdmc:/roms"; // last used download folder
+static unsigned download_streams = 2;
 
 static void present(void) { gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank(); }
 
@@ -67,16 +70,22 @@ static void mkdirs(char *dir) {
 	mkdir(dir, 0777);
 }
 
-// Opens a GET to the server; on success the caller reads the body and closes the context.
-static bool http_open(httpcContext *c, const char *path, u32 *size) {
+static bool http_create(httpcContext *c, const char *path, HTTPC_RequestMethod method) {
 	char url[1024];
 	int n = snprintf(url, sizeof url, "http://%s", server);
 	for (const unsigned char *p = (const unsigned char *)path; *p && n < (int)sizeof url - 4; p++)
 		n += (strchr("/-._~", *p) || (*p < 128 && isalnum(*p))) ? sprintf(url + n, "%c", *p) : sprintf(url + n, "%%%02X", *p);
 
-	u32 status = 0;
-	Result r = httpcOpenContext(c, HTTPC_METHOD_GET, url, 1);
+	Result r = httpcOpenContext(c, method, url, 1);
 	if (R_FAILED(r)) { printf("Bad URL %s\n", url); return false; }
+	return true;
+}
+
+// Opens a GET to the server; on success the caller reads the body and closes the context.
+static bool http_open(httpcContext *c, const char *path, u32 *size) {
+	if (!http_create(c, path, HTTPC_METHOD_GET)) return false;
+	u32 status = 0;
+	Result r;
 	if (R_FAILED(r = httpcBeginRequest(c)) || R_FAILED(r = httpcGetResponseStatusCode(c, &status))) {
 		printf("Can't reach %s (%08lX)\n", server, (unsigned long)r);
 	} else if (status != 200) {
@@ -84,8 +93,73 @@ static bool http_open(httpcContext *c, const char *path, u32 *size) {
 	} else if (R_SUCCEEDED(httpcGetDownloadSizeState(c, NULL, size))) {
 		return true;
 	}
+	httpcCancelConnection(c);
 	httpcCloseContext(c);
 	return false;
+}
+
+static bool range_info(const char *remote, u32 *size, char *etag, size_t capacity) {
+	httpcContext c;
+	if (!http_create(&c, remote, HTTPC_METHOD_HEAD)) return false;
+	u32 status = 0;
+	char length[32], ranges[32];
+	bool ok = R_SUCCEEDED(httpcBeginRequest(&c)) &&
+		R_SUCCEEDED(httpcGetResponseStatusCode(&c, &status)) && status == 200 &&
+		R_SUCCEEDED(httpcGetResponseHeader(&c, "Content-Length", length, sizeof length)) &&
+		R_SUCCEEDED(httpcGetResponseHeader(&c, "Accept-Ranges", ranges, sizeof ranges)) &&
+		!strcmp(ranges, "bytes") &&
+		R_SUCCEEDED(httpcGetResponseHeader(&c, "ETag", etag, capacity));
+	if (ok) {
+		char *end;
+		errno = 0;
+		unsigned long long value = strtoull(length, &end, 10);
+		ok = length[0] && !*end && !errno && value > 1 && value <= 0xFFFFFFFFULL;
+		if (ok) *size = value;
+	}
+	if (!ok) httpcCancelConnection(&c);
+	httpcCloseContext(&c);
+	return ok;
+}
+
+typedef struct {
+	u32 start, end, total;
+	const char *etag;
+} RangeCheck;
+
+static bool http_range_prepare(httpcContext *c, const char *remote, const RangeCheck *range) {
+	if (!http_create(c, remote, HTTPC_METHOD_GET)) return false;
+	char header[64];
+	snprintf(header, sizeof header, "bytes=%lu-%lu", (unsigned long)range->start, (unsigned long)range->end);
+	bool ok = R_SUCCEEDED(httpcAddRequestHeaderField(c, "Range", header)) &&
+		R_SUCCEEDED(httpcAddRequestHeaderField(c, "If-Range", range->etag));
+	if (!ok) {
+		printf("Can't start range request\n");
+		httpcCancelConnection(c);
+		httpcCloseContext(c);
+	}
+	return ok;
+}
+
+static Result http_range_check(httpcContext *c, void *arg) {
+	const RangeCheck *range = arg;
+	char expected[96], actual[96], response_etag[128];
+	snprintf(expected, sizeof expected, "bytes %lu-%lu/%lu", (unsigned long)range->start,
+		(unsigned long)range->end, (unsigned long)range->total);
+	u32 status = 0, length = 0;
+	Result r = httpcBeginRequest(c);
+	if (R_FAILED(r)) return r;
+	// The timed status command can time out despite a server response on real
+	// hardware. Keep the original status call in this worker; the consumer
+	// monitors aggregate progress and cancels stalled requests independently.
+	r = httpcGetResponseStatusCode(c, &status);
+	if (R_FAILED(r)) return r;
+	bool ok = status == 206 &&
+		R_SUCCEEDED(httpcGetResponseHeader(c, "Content-Range", actual, sizeof actual)) &&
+		!strcmp(actual, expected) &&
+		R_SUCCEEDED(httpcGetResponseHeader(c, "ETag", response_etag, sizeof response_etag)) &&
+		!strcmp(response_etag, range->etag) &&
+		R_SUCCEEDED(httpcGetDownloadSizeState(c, NULL, &length)) && length == range->end - range->start + 1;
+	return ok ? 0 : -1;
 }
 
 static char *fetch_listing(const char *path) {
@@ -100,22 +174,41 @@ static char *fetch_listing(const char *path) {
 	return buf;
 }
 
-static void download_progress(u64 done, u32 size, u64 started, u64 now) {
-	double seconds = (now - started) / (double)SYSCLOCK_ARM11;
+typedef struct {
+	u64 started, sample_tick, sample_bytes;
+	double peak;
+	bool drawn;
+} DownloadStats;
+
+static void download_progress(u64 done, u32 size, DownloadStats *stats, u64 now, bool final) {
+	u64 interval = now - stats->sample_tick;
+	// Sample aggregate throughput over at least a second, rather than letting
+	// short bursts from queued chunks produce misleading peaks.
+	if (interval >= SYSCLOCK_ARM11 || (final && !stats->peak && interval)) {
+		double rate = (done - stats->sample_bytes) * (double)SYSCLOCK_ARM11 / interval;
+		if (rate > stats->peak) stats->peak = rate;
+		stats->sample_tick = now;
+		stats->sample_bytes = done;
+	}
+	double seconds = (now - stats->started) / (double)SYSCLOCK_ARM11;
 	double bytes_per_second = seconds > 0 ? done / seconds : 0;
 	u64 remaining = done < size ? size - done : 0;
 	u64 eta = bytes_per_second > 0 ? (u64)(remaining / bytes_per_second) : 0;
+	if (stats->drawn) printf("\033[1A");
 	printf("\r\033[2K%lu/%lu MiB  %.2f MiB/s", (unsigned long)(done / 1048576),
 		(unsigned long)(size / 1048576), bytes_per_second / 1048576.0);
 	if (bytes_per_second > 0)
 		printf("  ETA %llu:%02llu", (unsigned long long)(eta / 60), (unsigned long long)(eta % 60));
+	printf("\n\r\033[2KMax throughput: %.2f MiB/s", stats->peak / 1048576.0);
+	stats->drawn = true;
 	// Download progress does not need to wait for a display frame.
 	gfxFlushBuffers();
 	gfxSwapBuffers();
 }
 
 // Streams to "<dest>.part" and renames on success so a failed download never clobbers a good file.
-static bool download(const char *remote, const char *dest) {
+static bool download_single(const char *remote, const char *dest) {
+	printf("Using 1 stream\n");
 	static char writebuf[WRITE_BUFFER_SIZE];
 	char part[600];
 	snprintf(part, sizeof part, "%s.part", dest);
@@ -146,7 +239,8 @@ static bool download(const char *remote, const char *dest) {
 	bool ok = true;
 	Result r = 0;
 	u64 started = svcGetSystemTick(), last_redraw = started;
-	download_progress(0, size, started, started);
+	DownloadStats stats = { .started = started, .sample_tick = started };
+	download_progress(0, size, &stats, started, false);
 	for (;;) {
 		const u8 *buf;
 		u32 got;
@@ -160,7 +254,7 @@ static bool download(const char *remote, const char *dest) {
 		}
 		u64 now = svcGetSystemTick();
 		if (now - last_redraw >= DOWNLOAD_REDRAW_TICKS) {
-			download_progress(done, size, started, now);
+			download_progress(done, size, &stats, now, false);
 			last_redraw = now;
 		}
 		hidScanInput();
@@ -171,7 +265,7 @@ static bool download(const char *remote, const char *dest) {
 	if (!ok) httpcCancelConnection(&c);
 	httpcCloseContext(&c);
 	if (fclose(f) != 0 && ok) { printf("\nWrite failed\n"); ok = false; }
-	if (ok) download_progress(done, size, started, svcGetSystemTick());
+	if (ok) download_progress(done, size, &stats, svcGetSystemTick(), true);
 	if (ok) {
 		remove(dest);
 		if (rename(part, dest) != 0) { printf("\nRename to %s failed\n", dest); ok = false; }
@@ -180,7 +274,261 @@ static bool download(const char *remote, const char *dest) {
 	return ok;
 }
 
+typedef struct {
+	Handle file;
+	u32 size;
+	u64 allocated;
+	LightLock lock;
+	bool cancelled, finished;
+	Result result;
+} FileAllocation;
+
+static void allocate_file(void *arg) {
+	FileAllocation *allocation = arg;
+	Result r = FSFILE_SetSize(allocation->file, 0);
+	u64 allocated = 0;
+	while (R_SUCCEEDED(r) && allocated < allocation->size) {
+		LightLock_Lock(&allocation->lock);
+		bool cancelled = allocation->cancelled;
+		LightLock_Unlock(&allocation->lock);
+		if (cancelled) break;
+		u64 next = allocated + 32 * 1024 * 1024;
+		if (next > allocation->size) next = allocation->size;
+		r = FSFILE_SetSize(allocation->file, next);
+		if (R_SUCCEEDED(r)) {
+			allocated = next;
+			LightLock_Lock(&allocation->lock);
+			allocation->allocated = allocated;
+			LightLock_Unlock(&allocation->lock);
+		}
+	}
+	LightLock_Lock(&allocation->lock);
+	allocation->result = r;
+	allocation->finished = true;
+	LightLock_Unlock(&allocation->lock);
+}
+
+static bool prepare_file(Handle file, u32 size) {
+	FileAllocation allocation = { .file = file, .size = size };
+	LightLock_Init(&allocation.lock);
+	Thread worker = threadCreate(allocate_file, &allocation, 16 * 1024, 0x30, -2, false);
+	if (!worker) { printf("Can't start SD allocation worker\n"); return false; }
+	u64 last_redraw = 0;
+	for (;;) {
+		LightLock_Lock(&allocation.lock);
+		u64 allocated = allocation.allocated;
+		bool finished = allocation.finished, cancelled = allocation.cancelled;
+		LightLock_Unlock(&allocation.lock);
+		u64 now = svcGetSystemTick();
+		if (now - last_redraw >= DOWNLOAD_REDRAW_TICKS || finished) {
+			printf("\r\033[2KAllocating SD space: %lu/%lu MiB", (unsigned long)(allocated / 1048576),
+				(unsigned long)(size / 1048576));
+			printf("\n\r\033[2K%s", cancelled ? "Cancelling SD allocation..." : "B: cancel");
+			gfxFlushBuffers(); gfxSwapBuffers();
+			last_redraw = now;
+			if (!finished) printf("\033[1A");
+		}
+		if (finished) break;
+		hidScanInput();
+		if (!aptMainLoop() || (hidKeysDown() & KEY_B)) {
+			LightLock_Lock(&allocation.lock);
+			allocation.cancelled = true;
+			LightLock_Unlock(&allocation.lock);
+		}
+		svcSleepThread(16000000);
+	}
+	threadJoin(worker, U64_MAX);
+	threadFree(worker);
+	printf("\n");
+	if (allocation.cancelled) { printf("Cancelled\n"); return false; }
+	if (R_FAILED(allocation.result)) {
+		printf("Can't allocate file (SD full?): %08lX\n", (unsigned long)allocation.result);
+		return false;
+	}
+	return true;
+}
+
+static bool download_parallel(const char *remote, const char *dest, u32 size, const char *etag, unsigned count) {
+	char part[600];
+	snprintf(part, sizeof part, "%s.part", dest);
+	const char *sdpath = !strncmp(part, "sdmc:", 5) ? part + 5 : part;
+	u16 utf16[600];
+	ssize_t units = utf8_to_utf16(utf16, (const u8 *)sdpath, 599);
+	if (units < 0 || units > 599) { printf("Invalid SD path\n"); return false; }
+	utf16[units] = 0;
+	Handle file;
+	Result r = FSUSER_OpenFileDirectly(&file, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""),
+		fsMakePath(PATH_UTF16, utf16), FS_OPEN_WRITE | FS_OPEN_CREATE, 0);
+	if (R_FAILED(r)) { printf("Can't create file (%08lX)\n", (unsigned long)r); return false; }
+	printf("Preparing file for %u streams...\n", count);
+	present();
+	if (!prepare_file(file, size)) {
+		FSFILE_Close(file);
+		remove(part);
+		return false;
+	}
+
+	httpcContext contexts[MAX_DOWNLOAD_STREAMS];
+	RangeCheck ranges[MAX_DOWNLOAD_STREAMS];
+	DownloadStream *streams[MAX_DOWNLOAD_STREAMS] = {0};
+	u32 start[MAX_DOWNLOAD_STREAMS], length[MAX_DOWNLOAD_STREAMS];
+	u64 written[MAX_DOWNLOAD_STREAMS] = {0}, done = 0;
+	bool finished[MAX_DOWNLOAD_STREAMS] = {0}, ok = true;
+	bool context_open[MAX_DOWNLOAD_STREAMS] = {0};
+	unsigned remaining = count;
+	int opened = 0;
+	printf("Connecting %u streams...\n", count);
+	present();
+	for (unsigned i = 0; i < count; i++) {
+		download_range(size, i, count, &start[i], &length[i]);
+		ranges[i] = (RangeCheck){ start[i], start[i] + length[i] - 1, size, etag };
+		if (!http_range_prepare(&contexts[i], remote, &ranges[i])) { ok = false; break; }
+		opened++;
+		context_open[i] = true;
+		streams[i] = download_stream_start_checked(&contexts[i], http_range_check, &ranges[i]);
+		if (!streams[i]) { printf("Can't start download worker\n"); ok = false; break; }
+	}
+	u64 started = svcGetSystemTick(), last_redraw = started;
+	u64 last_activity = started;
+	DownloadStats stats = { .started = started, .sample_tick = started };
+	if (ok) download_progress(0, size, &stats, started, false);
+	while (ok && remaining) {
+		bool active = false;
+		for (unsigned i = 0; i < count && ok; i++) {
+			if (finished[i]) continue;
+			const u8 *data;
+			u32 got;
+			int state = download_stream_poll(streams[i], &data, &got, &r);
+			if (state == DOWNLOAD_FINISHED) {
+				finished[i] = true;
+				remaining--;
+				if (R_FAILED(r) || written[i] != length[i]) {
+					printf("\nStream %u failed (%08lX)\n", i + 1, (unsigned long)r);
+					ok = false;
+				} else {
+					// Release a completed request immediately so any request
+					// queued by the HTTP service can start using its slot.
+					download_stream_stop(streams[i]);
+					streams[i] = NULL;
+					httpcCloseContext(&contexts[i]);
+					context_open[i] = false;
+				}
+			} else if (state == DOWNLOAD_DATA) {
+				active = true;
+				u32 saved = 0;
+				if (written[i] + got > length[i]) {
+					printf("\nStream exceeded its requested range\n");
+					ok = false;
+				} else {
+					// Native writes take 64-bit offsets, including beyond 2 GiB.
+					r = FSFILE_Write(file, &saved, start[i] + written[i], data, got, 0);
+					if (R_FAILED(r) || saved != got) { printf("\nWrite failed (SD full?)\n"); ok = false; }
+				}
+				download_stream_release(streams[i]);
+				written[i] += saved;
+				done += saved;
+			}
+		}
+		u64 now = svcGetSystemTick();
+		if (active) last_activity = now;
+		if (ok && remaining && now - last_activity >= 30ULL * SYSCLOCK_ARM11) {
+			printf("\nNo download progress for 30 seconds.\n");
+			ok = false;
+		}
+		if (now - last_redraw >= DOWNLOAD_REDRAW_TICKS) {
+			download_progress(done, size, &stats, now, false);
+			last_redraw = now;
+		}
+		hidScanInput();
+		if (!aptMainLoop() || (hidKeysDown() & KEY_B)) { printf("\nCancelled\n"); ok = false; }
+		if (!active && ok) svcSleepThread(5000000);
+	}
+	// Cancel all requests before joining any worker, including workers still
+	// waiting for their response headers.
+	if (!ok) {
+		for (int i = 0; i < opened; i++)
+			if (context_open[i]) httpcCancelConnection(&contexts[i]);
+	}
+	for (int i = 0; i < opened; i++) {
+		if (!context_open[i]) continue;
+		if (streams[i]) download_stream_stop(streams[i]);
+		if (!ok || !streams[i]) httpcCancelConnection(&contexts[i]);
+		httpcCloseContext(&contexts[i]);
+	}
+	if (R_FAILED(FSFILE_Flush(file))) { printf("\nSD flush failed\n"); ok = false; }
+	if (R_FAILED(FSFILE_Close(file))) { printf("\nSD close failed\n"); ok = false; }
+	if (ok) {
+		download_progress(done, size, &stats, svcGetSystemTick(), true);
+		remove(dest);
+		if (rename(part, dest) != 0) { printf("\nRename failed\n"); ok = false; }
+	}
+	if (!ok) remove(part);
+	return ok;
+}
+
+static bool download(const char *remote, const char *dest) {
+	u32 size;
+	char etag[128];
+	bool absolute_sd = !strncmp(dest, "sdmc:/", 6) || dest[0] == '/';
+	if (download_streams > 1 && absolute_sd && range_info(remote, &size, etag, sizeof etag) && size >= 1024 * 1024)
+		return download_parallel(remote, dest, size, etag, download_streams);
+	return download_single(remote, dest);
+}
+
+static DownloadStats install_stats;
+static u64 install_redraw;
+
+static bool confirm_install(const AM_TitleInfo *info, u64 required) {
+	consoleClear();
+	printf("Install CIA to SD?\n\nTitle: %016llX\nVersion: %u\nSpace needed: %llu MiB\n\n"
+		"An existing title may be replaced.\nThe downloaded CIA will be kept.\n\nA: install   B: cancel\n",
+		(unsigned long long)info->titleID, info->version,
+		(unsigned long long)((required + 1048575) / 1048576));
+	for (;;) {
+		u32 key = wait_key();
+		if (key & (KEY_B | KEY_START)) return false;
+		if (key & KEY_A) break;
+	}
+	consoleClear();
+	printf("Installing CIA...\n\nB: cancel\n\n");
+	u64 now = svcGetSystemTick();
+	install_stats = (DownloadStats){ .started = now, .sample_tick = now };
+	install_redraw = now;
+	return true;
+}
+
+static bool install_progress(u64 done, u64 total) {
+	u64 now = svcGetSystemTick();
+	if (!done || done == total || now - install_redraw >= DOWNLOAD_REDRAW_TICKS) {
+		download_progress(done, (u32)total, &install_stats, now, done == total);
+		install_redraw = now;
+	}
+	hidScanInput();
+	return aptMainLoop() && !(hidKeysDown() & KEY_B);
+}
+
 static void download_flow(const char *path, const char *name, long long size) {
+	bool install = false;
+	size_t name_len = strlen(name);
+	if (name_len >= 4 && strcasecmp(name + name_len - 4, ".cia") == 0) {
+		consoleClear();
+		printf("%s\n\nA: download only\nX: download then install\nB: cancel\n", name);
+		for (;;) {
+			u32 key = wait_key();
+			if (key & (KEY_B | KEY_START)) return;
+			if (key & KEY_X) { install = true; break; }
+			if (key & KEY_A) break;
+		}
+		if (install) {
+			Result r = amInit();
+			if (R_FAILED(r)) {
+				printf("\nCan't access installer (%08lX).\nRun under Luma3DS CFW.\n\nPress any button", (unsigned long)r);
+				wait_key();
+				return;
+			}
+			amExit();
+		}
+	}
 	if (size > 0xFFFFFFFFLL) {
 		consoleClear();
 		printf("%s\n\nFile is too large for the SD card.\n"
@@ -193,6 +541,12 @@ static void download_flow(const char *path, const char *name, long long size) {
 	char dir[256];
 	strcpy(dir, destdir);
 	if (!keyboard("Save to folder (e.g. sdmc:/roms/gba)", dir, sizeof dir)) return;
+	if (install && strncmp(dir, "sdmc:/", 6) != 0) {
+		consoleClear();
+		printf("Installation needs an absolute sdmc:/\nfolder, e.g. sdmc:/cias.\n\nPress any button");
+		wait_key();
+		return;
+	}
 	size_t len = strlen(dir);
 	while (len > 1 && dir[len - 1] == '/') dir[--len] = 0;
 	mkdirs(dir);
@@ -225,7 +579,17 @@ static void download_flow(const char *path, const char *name, long long size) {
 	if (download(remote, dest)) {
 		strcpy(destdir, dir);
 		save_config();
-		printf("\nDone!");
+		if (install) {
+			const char *error;
+			Result result;
+			if (cia_install(dest, confirm_install, install_progress, &error, &result))
+				printf("\nInstalled! CIA kept at:\n%s", dest);
+			else {
+				printf("\n%s\n", error);
+				if (R_FAILED(result)) printf("Error: %08lX\n", (unsigned long)result);
+				printf("Downloaded CIA kept at:\n%s", dest);
+			}
+		} else printf("\nDone!");
 	}
 	printf("\n\nPress any button");
 	wait_key();
@@ -293,14 +657,14 @@ static u32 menu(const char *path, const char *filter, Entry *e, int n, int *cur)
 		for (int i = top; i < end; i++) draw_entry(&e[i], i == *cur);
 		int page = end - top;
 		if (!n) printf("  (empty)\n");
-		printf("\nA:open B:back Y:filter X:server\nR:refresh START:quit");
+		printf("\nA:open B:back Y:filter X:server\nL:streams=%u R:refresh START:quit", download_streams);
 
 		u32 k = wait_key();
 		if (n && (k & KEY_DOWN)) *cur = (*cur + 1) % n;
 		else if (n && (k & KEY_UP)) *cur = (*cur + n - 1) % n;
 		else if (n && (k & KEY_RIGHT)) *cur = *cur + page < n ? *cur + page : n - 1;
 		else if (n && (k & KEY_LEFT)) *cur = *cur > page ? *cur - page : 0;
-		else if (k & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_R | KEY_START)) return k;
+		else if (k & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_L | KEY_R | KEY_START)) return k;
 	}
 }
 
@@ -349,6 +713,7 @@ int main(void) {
 		while (!quit && !reload) {
 			u32 k = menu(path, filter, e, n, &cur);
 			if (k & KEY_START) quit = true;
+			else if (k & KEY_L) download_streams = download_streams % MAX_DOWNLOAD_STREAMS + 1;
 			else if (k & KEY_R) {
 				if (n) snprintf(selected, sizeof selected, "%s", e[cur].name);
 				reload = true;

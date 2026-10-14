@@ -57,10 +57,12 @@ install-converter: .tools/3dsconv/bin/rom-io-3dsconv ## Install 3dsconv in a loc
 test: ## Run the server tests
 	cd server && $(PYTHON) -m unittest
 
-test-client: ## Run download queue tests on the host computer
+test-client: ## Run download queue and CIA installation tests on the host computer
 	@mkdir -p .tools/tests
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread -Iclient/tests -Iclient/include client/source/download_stream.c client/tests/test_download_stream.c -o .tools/tests/download-stream
 	.tools/tests/download-stream
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Iclient/tests/cia -Iclient/include client/source/cia_install.c client/tests/test_cia_install.c -o .tools/tests/cia-install
+	.tools/tests/cia-install
 
 clean: ## Remove client build artifacts
 	$(MAKE) -C client clean
