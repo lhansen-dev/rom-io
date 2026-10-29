@@ -7,13 +7,41 @@ static int fail, starts, finishes, cancels, closes, exits;
 static bool approve, stop;
 static u64 title, free_bytes, written_total;
 static bool short_read, short_write;
+static const char *install_path;
+static const u16 *expected_path;
 enum { INIT = 1, OPEN, SIZE, INFO, SPACE, RESOURCE, START, READ, WRITE, FINISH, CANCEL };
 static Result status(int operation) { return fail == operation ? -operation : 0; }
+// Same contract as libctru: returns the units needed, writes at most len, and adds no terminator.
+ssize_t utf8_to_utf16(u16 *out, const u8 *in, size_t len) {
+	size_t units = 0;
+	while (*in) {
+		int extra = *in < 0x80 ? 0 : *in >= 0xF8 ? -1 : *in >= 0xF0 ? 3 : *in >= 0xE0 ? 2 : *in >= 0xC0 ? 1 : -1;
+		if (extra < 0) return -1;
+		u32 code = *in++ & (extra ? 0x3F >> extra : 0x7F);
+		for (; extra; extra--, in++) {
+			if ((*in & 0xC0) != 0x80) return -1;
+			code = code << 6 | (*in & 0x3F);
+		}
+		if (code >= 0x10000) {
+			code -= 0x10000;
+			if (units < len) out[units] = 0xD800 | code >> 10;
+			units++;
+			code = 0xDC00 | (code & 0x3FF);
+		}
+		if (units < len) out[units] = code;
+		units++;
+	}
+	return units;
+}
 Result amInit(void) { return status(INIT); }
 void amExit(void) { exits++; }
 Result FSUSER_OpenFileDirectly(Handle *out, int archive, FS_Path root, FS_Path file, u32 flags, u32 attributes) {
 	assert(archive == ARCHIVE_SDMC && flags == FS_OPEN_READ && !attributes);
-	assert(!strcmp(root.data, "") && !strcmp(file.data, "/cias/test.cia"));
+	assert(root.type == PATH_EMPTY && !strcmp(root.data, "") && file.type == PATH_UTF16);
+	const u16 *name = file.data;
+	size_t i = 0;
+	while (expected_path[i] && name[i] == expected_path[i]) i++;
+	assert(!expected_path[i] && !name[i]);
 	if (fail != OPEN) *out = 1;
 	return status(OPEN);
 }
@@ -51,10 +79,11 @@ static void reset(void) {
 	fail = starts = finishes = cancels = closes = exits = 0;
 	approve = true; stop = short_read = short_write = false;
 	title = 0x0004000001234500ULL; free_bytes = 1000000; written_total = 0;
+	install_path = "sdmc:/cias/test.cia"; expected_path = u"/cias/test.cia";
 }
 static bool run(void) {
 	const char *error; Result result;
-	bool ok = cia_install("sdmc:/cias/test.cia", confirm, progress, &error, &result);
+	bool ok = cia_install(install_path, confirm, progress, &error, &result);
 	assert(ok ? !error : error != NULL);
 	assert(exits == (fail == INIT ? 0 : 1));
 	assert(closes == (fail == INIT || fail == OPEN ? 0 : 1));
@@ -75,7 +104,14 @@ int main(void) {
 	reset(); title = 0x0004013800000002ULL; assert(!run()); assert(!starts);
 	reset(); title = 0x0004800400000002ULL; assert(!run()); assert(!starts);
 	reset(); fail = CANCEL; stop = true; assert(!run()); assert(cancels == 1);
-	reset(); const char *error; Result result;
-	assert(!cia_install("roms/test.cia", confirm, progress, &error, &result)); assert(!exits && !starts);
+	reset(); install_path = u8"sdmc:/cias/Pokémon X (USA).cia"; expected_path = u"/cias/Pokémon X (USA).cia";
+	assert(run()); assert(finishes == 1);
+	char long_path[600] = "sdmc:/";
+	memset(long_path + 6, 'a', sizeof long_path - 7);
+	const char *rejected[] = { "roms/test.cia", "sdmc:/cias/\xff.cia", long_path };
+	for (size_t i = 0; i < sizeof rejected / sizeof *rejected; i++) {
+		reset(); const char *error; Result result;
+		assert(!cia_install(rejected[i], confirm, progress, &error, &result)); assert(error && !exits && !starts);
+	}
 	puts("CIA installation tests passed");
 }

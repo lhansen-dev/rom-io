@@ -3,6 +3,7 @@
 #include <string.h>
 
 #define INSTALL_CHUNK (256 * 1024)
+#define PATH_UNITS 512
 
 bool cia_install(const char *path, CiaConfirm confirm, CiaProgress progress,
 	const char **error, Result *result) {
@@ -12,18 +13,26 @@ bool cia_install(const char *path, CiaConfirm confirm, CiaProgress progress,
 	u64 size = 0, required = 0, done = 0;
 	AM_TitleInfo info;
 	FS_ArchiveResource space;
+	u16 sdpath[PATH_UNITS];
 	*result = 0;
 	*error = NULL;
 	if (strncmp(path, "sdmc:/", 6) != 0) {
 		*error = "Installation needs an absolute sdmc:/ path.";
 		goto cleanup;
 	}
+	// Open by UTF-16 path, as the downloader writes it, so non-ASCII names work.
+	ssize_t units = utf8_to_utf16(sdpath, (const u8 *)path + 5, PATH_UNITS - 1);
+	if (units < 0 || units > PATH_UNITS - 1) {
+		*error = "Invalid or too long CIA path.";
+		goto cleanup;
+	}
+	sdpath[units] = 0;
 	*error = "Can't access installer. Run under Luma3DS CFW.";
 	if (R_FAILED(*result = amInit())) goto cleanup;
 	am_ready = true;
 	*error = "Can't open downloaded CIA.";
 	if (R_FAILED(*result = FSUSER_OpenFileDirectly(&source, ARCHIVE_SDMC,
-		fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, path + 5), FS_OPEN_READ, 0))) goto cleanup;
+		fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_UTF16, sdpath), FS_OPEN_READ, 0))) goto cleanup;
 	*error = "Invalid or unreadable CIA.";
 	if (R_FAILED(*result = FSFILE_GetSize(source, &size)) || !size) goto cleanup;
 	if (R_FAILED(*result = AM_GetCiaFileInfo(MEDIATYPE_SD, &info, source))) goto cleanup;
